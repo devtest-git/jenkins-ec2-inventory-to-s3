@@ -1,0 +1,134 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'TARGET_ACCOUNT_IDS',
+               defaultValue: '442889374161',
+               description: 'Comma separated AWS Account IDs')
+        string(name: 'REGION',
+               defaultValue: 'ap-south-1',
+               description: 'AWS Region')
+    }
+
+    environment {
+        ROLE_NAME = 'Jenkins-CrossAccount-Admin'
+        S3_BUCKET = 'jenkins-log-files-s3-bucket'
+    }
+
+    stages {
+
+        stage('Snapshot Inventory Report') {
+            steps {
+                script {
+
+                    if (!params.TARGET_ACCOUNT_IDS?.trim()) {
+                        error "TARGET_ACCOUNT_IDS cannot be empty"
+                    }
+
+                    def accounts = params.TARGET_ACCOUNT_IDS.split(',').collect { it.trim() }
+
+                    for (accountId in accounts) {
+
+                        sh """
+                        set -euo pipefail
+
+                        echo "======================================"
+                        echo "Processing Account: ${accountId}"
+                        echo "======================================"
+
+                        # IST Timestamp (UTC+5:30)
+                        TIMESTAMP=\$(TZ=Asia/Kolkata date +"%d-%m-%Y-%I:%M%p")
+
+                        SNAP_FILE="snapshot-inventory-${accountId}-\${TIMESTAMP}.csv"
+                        NOSNAP_FILE="no-snapshot-${accountId}-\${TIMESTAMP}.csv"
+
+                        # Assume cross-account role
+                        CREDS=\$(aws sts assume-role \
+                          --role-arn arn:aws:iam::${accountId}:role/${ROLE_NAME} \
+                          --role-session-name jenkins-session-${accountId} \
+                          --query 'Credentials' \
+                          --output json)
+
+                        export AWS_ACCESS_KEY_ID=\$(echo \$CREDS | jq -r '.AccessKeyId')
+                        export AWS_SECRET_ACCESS_KEY=\$(echo \$CREDS | jq -r '.SecretAccessKey')
+                        export AWS_SESSION_TOKEN=\$(echo \$CREDS | jq -r '.SessionToken')
+
+                        aws sts get-caller-identity
+
+                        # CSV Headers
+                        echo "S.No,EC2 Name,Instance ID,Private IP,Volume Name,Volume ID,Latest Snapshot Date,Snapshot ID,Volume Size (GiB),Snapshot Description,Encryption,KMS Key ID" > \$SNAP_FILE
+
+                        echo "S.No,EC2 Name,Instance ID,Private IP,Volume Name,Volume ID,Volume Size (GiB),Reason" > \$NOSNAP_FILE
+
+                        # Get EC2 instances
+                        INSTANCES=\$(aws ec2 describe-instances --region ${params.REGION} \
+                          --query "Reservations[].Instances[].[InstanceId,PrivateIpAddress,Tags[?Key=='Name']|[0].Value]" \
+                          --output text)
+
+                        COUNT=1
+
+                        echo "\$INSTANCES" | while read INSTANCE_ID PRIVATE_IP EC2_NAME
+                        do
+                            EC2_NAME=\${EC2_NAME:-N/A}
+                            PRIVATE_IP=\${PRIVATE_IP:-N/A}
+
+                            # Get attached volumes
+                            VOLUMES=\$(aws ec2 describe-volumes \
+                              --region ${params.REGION} \
+                              --filters Name=attachment.instance-id,Values=\$INSTANCE_ID \
+                              --query "Volumes[].[VolumeId,Size,Encrypted,KmsKeyId,Tags[?Key=='Name']|[0].Value]" \
+                              --output text)
+
+                            if [ -z "\$VOLUMES" ] || [ "\$VOLUMES" = "None" ]; then
+                                echo "\$COUNT,\$EC2_NAME,\$INSTANCE_ID,\$PRIVATE_IP,N/A,N/A,N/A,No EBS volume attached" >> \$NOSNAP_FILE
+                                COUNT=\$((COUNT+1))
+                                continue
+                            fi
+
+                            echo "\$VOLUMES" | while read VOL_ID VOL_SIZE ENCRYPTED KMS_KEY VOL_NAME
+                            do
+                                VOL_NAME=\${VOL_NAME:-N/A}
+
+                                SNAPSHOT=\$(aws ec2 describe-snapshots \
+                                  --region ${params.REGION} \
+                                  --owner-ids self \
+                                  --filters Name=volume-id,Values=\$VOL_ID \
+                                  --query "Snapshots | sort_by(@,&StartTime)[-1].[SnapshotId,StartTime,Description]" \
+                                  --output text 2>/dev/null)
+
+                                if [ -z "\$SNAPSHOT" ] || [ "\$SNAPSHOT" = "None" ]; then
+                                    echo "\$COUNT,\$EC2_NAME,\$INSTANCE_ID,\$PRIVATE_IP,\$VOL_NAME,\$VOL_ID,\$VOL_SIZE,No snapshot found" >> \$NOSNAP_FILE
+                                else
+                                    read SNAP_ID SNAP_DATE SNAP_DESC <<< "\$SNAPSHOT"
+
+                                    echo "\$COUNT,\$EC2_NAME,\$INSTANCE_ID,\$PRIVATE_IP,\$VOL_NAME,\$VOL_ID,\$SNAP_DATE,\$SNAP_ID,\$VOL_SIZE,\\"\$SNAP_DESC\\",\$ENCRYPTED,\$KMS_KEY" >> \$SNAP_FILE
+                                fi
+                            done
+
+                            COUNT=\$((COUNT+1))
+                        done
+
+                        # Unset assumed credentials before S3 upload
+                        unset AWS_ACCESS_KEY_ID
+                        unset AWS_SECRET_ACCESS_KEY
+                        unset AWS_SESSION_TOKEN
+
+                        echo "Uploading reports to S3 using Jenkins EC2 role..."
+
+                        aws s3 cp \$SNAP_FILE s3://${S3_BUCKET}/snapshot-inventory/${accountId}/
+                        aws s3 cp \$NOSNAP_FILE s3://${S3_BUCKET}/snapshot-inventory/${accountId}/
+
+                        echo "Upload completed for ${accountId}"
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Snapshot inventory pipeline completed."
+        }
+    }
+}
