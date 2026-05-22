@@ -1,0 +1,116 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'TARGET_ACCOUNT_IDS', defaultValue: '442889374161', description: 'Comma-separated AWS account IDs')
+        string(name: 'REGION', defaultValue: 'ap-south-1', description: 'AWS Region')
+    }
+    environment {
+        ROLE_NAME = 'Jenkins-CrossAccount-Admin'
+        S3_BUCKET = 'jenkins-log-files-s3-bucket'
+    }
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    if (!params.TARGET_ACCOUNT_IDS?.trim()) {
+                        error "TARGET_ACCOUNT_IDS is empty. Provide one or more account IDs separated by commas."
+                    }
+                }
+            }
+        }
+
+        stage('EBS Inventory') {
+            steps {
+                script {
+                    def accounts = params.TARGET_ACCOUNT_IDS.split(',').collect { it.trim() }.findAll { it }
+                    def branches = [:]
+
+                    for (int i = 0; i < accounts.size(); i++) {
+                        def accountId = accounts[i]
+                        branches["Account-${accountId}"] = {
+                            node {
+                                stage("EBS Inventory for Account-${accountId}") {
+                                    withEnv(["REGION=${params.REGION}"]) {
+                                        sh """
+                                            set -euo pipefail
+                                            set -x
+
+                                            echo "========================================"
+                                            echo "Processing account: ${accountId}"
+                                            echo "========================================"
+
+                                            # Assume role
+                                            CREDS=\$(aws sts assume-role \\
+                                                --role-arn arn:aws:iam::${accountId}:role/${ROLE_NAME} \\
+                                                --role-session-name jenkins-session-${accountId} \\
+                                                --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \\
+                                                --output text)
+
+                                            export AWS_ACCESS_KEY_ID=\$(echo \$CREDS | awk '{print \$1}')
+                                            export AWS_SECRET_ACCESS_KEY=\$(echo \$CREDS | awk '{print \$2}')
+                                            export AWS_SESSION_TOKEN=\$(echo \$CREDS | awk '{print \$3}')
+
+                                            # Verify identity
+                                            aws sts get-caller-identity
+
+                                            # Fetch EBS volumes
+                                            aws ec2 describe-volumes --region $REGION --output json > volumes-${accountId}.json
+
+                                            # CSV header
+                                            echo "Name,Volume ID,Type,Size,IOPS,Throughput,Snapshot ID,Source volume ID,Created,Availability Zone,Volume state,Alarm status,Attached resources,Status check,Initialization state,Encryption,KMS key ID,KMS key alias,Fast snapshot restored,Multi-Attach enabled" > ebs-inventory-${accountId}.csv
+
+                                            # Convert JSON to CSV
+                                            cat volumes-${accountId}.json | jq -r '
+                                              (.Volumes // [])[]? |
+                                              [
+                                                ( (.Tags // [])[]? | select(.Key=="Name") | .Value ) // "",
+                                                .VolumeId // "",
+                                                .VolumeType // "",
+                                                .Size // "",
+                                                .Iops // "",
+                                                .Throughput // "",
+                                                .SnapshotId // "",
+                                                .OutpostArn // "",
+                                                .CreateTime // "",
+                                                .AvailabilityZone // "",
+                                                .State // "",
+                                                "N/A",
+                                                ( [.Attachments[]?.InstanceId] | join(";") ) // "",
+                                                "N/A",
+                                                "N/A",
+                                                .Encrypted // "",
+                                                .KmsKeyId // "",
+                                                "",
+                                                .FastRestored // "",
+                                                .MultiAttachEnabled // ""
+                                              ] | @csv
+                                            ' >> ebs-inventory-${accountId}.csv || true
+
+                                            # Unset assumed credentials
+                                            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+                                            # Upload to S3 (Jenkins role)
+                                            aws s3 cp ebs-inventory-${accountId}.csv s3://${S3_BUCKET}/ebs-inventory/${accountId}/ebs-inventory-${accountId}.csv
+
+                                            echo "EBS inventory for account ${accountId} uploaded to s3://${S3_BUCKET}/ebs-inventory/${accountId}/"
+                                        """
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    parallel branches
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "EBS inventory pipeline finished."
+            }
+        }
+    }
+}
