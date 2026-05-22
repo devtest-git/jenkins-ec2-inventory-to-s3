@@ -1,6 +1,6 @@
-# Jenkins AWS EC2 Inventory Pipeline
+# Jenkins AWS Inventory Pipeline
 
-This repository contains a Jenkins pipeline that collects EC2 instance inventory across multiple AWS accounts using cross-account role assumption and uploads the results to an S3 bucket.
+This repository contains a Jenkins pipeline that collects instance inventory across multiple AWS accounts using cross-account role assumption and uploads the results to an S3 bucket.
 
 ---
 
