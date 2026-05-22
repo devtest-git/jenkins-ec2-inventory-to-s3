@@ -83,11 +83,3 @@ s3://jenkins-log-files-s3-bucket/ec2-inventory/<account-id>/
   * `ec2:DescribeInstances`
   * `ec2:DescribeVolumes`
   * `s3:PutObject`
-
----
-
-## 👨‍💻 Author
-
-Maintained for DevOps automation and cloud inventory tracking.
-
----
